@@ -8,21 +8,20 @@ $ErrorActionPreference = "Stop"
 
 # ---------- LOGGER ----------
 . "$PSScriptRoot\migrate_logger.ps1"
-$log = New-Logger -Component "AzureMigrate-EnableReplication"
+$log = New-Logger -Component "AzureMigrate-Replication"
 
 $log.Step("Script started")
 
-# ---------- LOGIN CHECK ----------
+# ---------- LOGIN ----------
 $ctx = Get-AzContext
 if (-not $ctx) {
-    throw "Azure context not found. Run Connect-AzAccount."
+    throw "Azure login missing. Run Connect-AzAccount."
 }
 $log.Info("Logged in as $($ctx.Account.Id)")
-$log.Info("Default subscription $($ctx.Subscription.Id)")
 
-# ---------- CSV LOAD ----------
+# ---------- CSV ----------
 if (-not (Test-Path $CsvFilePath)) {
-    throw "CSV file not found: $CsvFilePath"
+    throw "CSV not found: $CsvFilePath"
 }
 
 $rows = Import-Csv $CsvFilePath
@@ -30,97 +29,96 @@ if ($rows.Count -eq 0) {
     throw "CSV is empty"
 }
 
-$log.Info("Loaded $($rows.Count) machine(s) from CSV")
+$log.Info("Loaded $($rows.Count) record(s)")
 
-# ---------- PROCESS EACH MACHINE ----------
 foreach ($row in $rows) {
 
-    $log.Step("Processing new machine")
+    $log.Step("Processing VM '$($row.VM_NAME)'")
 
-    # ----- Mandatory fields -----
+    # ---------- VALIDATION ----------
     foreach ($col in @(
-        "MACHINE_ID",
+        "AZMIGRATE_PROJECT_SUBSCRIPTION",
+        "AZMIGRATE_PROJECT_RESOURCE_GROUP",
+        "AZMIGRATE_PROJECT_NAME",
+        "VM_NAME",
         "TARGET_SUBSCRIPTION_ID",
         "TARGET_RESOURCE_GROUP",
-        "TARGET_LOCATION",
         "TARGET_VNET_ID",
         "TARGET_SUBNET_NAME"
     )) {
         if (-not $row.$col) {
-            throw "Missing required CSV column value: $col"
+            throw "Missing required CSV column: $col"
         }
     }
 
-    $machineId = $row.MACHINE_ID.Trim()
-    $subId     = $row.TARGET_SUBSCRIPTION_ID.Trim()
-    $rg        = $row.TARGET_RESOURCE_GROUP.Trim()
-    $location  = $row.TARGET_LOCATION.Trim()
-    $vnetId    = $row.TARGET_VNET_ID.Trim()
-    $subnet    = $row.TARGET_SUBNET_NAME.Trim()
+    # ---------- CONTEXT ----------
+    Set-AzContext -SubscriptionId $row.AZMIGRATE_PROJECT_SUBSCRIPTION | Out-Null
+    $log.Info("Set context to Azure Migrate project subscription")
 
-    $vmSize    = $row.TARGET_VM_SIZE
-    $diskType  = $row.TARGET_DISK_TYPE
-    $availType = $row.AVAILABILITY_TYPE
-    $tagsRaw   = $row.TAGS
+    # ---------- FIND MACHINE (RESOURCE GRAPH) ----------
+    $query = @"
+resources
+| where resourceGroup == '$($row.AZMIGRATE_PROJECT_RESOURCE_GROUP)'
+| where type =~ 'microsoft.offazure/vmwaresites/machines'
+| where name =~ '$($row.VM_NAME)'
+| where properties.migrateProjectName =~ '$($row.AZMIGRATE_PROJECT_NAME)'
+| project id, name
+"@
 
-    $log.Info("Machine ID : $machineId")
-    $log.Info("Target RG  : $rg")
-    $log.Info("Region     : $location")
-    $log.Info("VNet       : $vnetId")
-    $log.Info("Subnet     : $subnet")
+    $result = Search-AzGraph -Query $query
 
-    # ----- Subscription context -----
-    Set-AzContext -SubscriptionId $subId | Out-Null
-    $log.Info("Switched to subscription $subId")
+    if ($result.Count -eq 0) {
+        throw "VM '$($row.VM_NAME)' not found in Azure Migrate project '$($row.AZMIGRATE_PROJECT_NAME)'"
+    }
 
-    # ----- Build properties -----
+    if ($result.Count -gt 1) {
+        throw "Multiple machines named '$($row.VM_NAME)' found. Use explicit MACHINE_ID."
+    }
+
+    $machineId = $result[0].id
+    $log.Info("Resolved MACHINE_ID: $machineId")
+
+    # ---------- TARGET CONTEXT ----------
+    Set-AzContext -SubscriptionId $row.TARGET_SUBSCRIPTION_ID | Out-Null
+    $log.Info("Switched to target subscription")
+
+    # ---------- BUILD PAYLOAD ----------
     $properties = @{
-        targetResourceGroupId = "/subscriptions/$subId/resourceGroups/$rg"
-        targetLocation        = $location
-        networkSettings       = @{
-            targetVNetId     = $vnetId
-            targetSubnetName = $subnet
+        targetResourceGroupId = "/subscriptions/$($row.TARGET_SUBSCRIPTION_ID)/resourceGroups/$($row.TARGET_RESOURCE_GROUP)"
+        networkSettings = @{
+            targetVNetId     = $row.TARGET_VNET_ID
+            targetSubnetName = $row.TARGET_SUBNET_NAME
         }
     }
 
-    # Compute (VM size)
-    if ($vmSize) {
+    if ($row.TARGET_VM_SIZE) {
         $properties.computeSettings = @{
-            targetVmSize = $vmSize
+            targetVmSize = $row.TARGET_VM_SIZE
         }
-        $log.Info("Target VM size set to $vmSize")
-    } else {
-        $log.Info("No VM size specified – Azure Migrate will use recommendation")
+        $log.Info("VM size set to $($row.TARGET_VM_SIZE)")
     }
 
-    # Disk type
-    if ($diskType) {
-        $allowedDisk = @("StandardHDD","StandardSSD","PremiumSSD")
-        if ($allowedDisk -notcontains $diskType) {
-            throw "Invalid TARGET_DISK_TYPE. Allowed: $($allowedDisk -join ', ')"
+    if ($row.TARGET_DISK_TYPE) {
+        $allowed = @("StandardHDD","StandardSSD","PremiumSSD")
+        if ($allowed -notcontains $row.TARGET_DISK_TYPE) {
+            throw "Invalid TARGET_DISK_TYPE"
         }
         $properties.storageSettings = @{
-            targetDiskType = $diskType
+            targetDiskType = $row.TARGET_DISK_TYPE
         }
-        $log.Info("Target disk type set to $diskType")
-    } else {
-        $log.Info("No disk type specified – Azure Migrate will use recommendation")
+        $log.Info("Disk type set to $($row.TARGET_DISK_TYPE)")
     }
 
-    # Availability
-    if ($availType -eq "Zone") {
+    if ($row.AVAILABILITY_TYPE -eq "Zone") {
         $properties.availabilitySettings = @{
             availabilityType = "Zone"
         }
         $log.Info("Availability set to Zone")
-    } else {
-        $log.Info("No availability option selected")
     }
 
-    # Tags
-    if ($tagsRaw) {
+    if ($row.TAGS) {
         $tagHash = @{}
-        $tagsRaw.Split(';') | ForEach-Object {
+        $row.TAGS.Split(';') | ForEach-Object {
             $kv = $_.Split('=')
             if ($kv.Count -eq 2) {
                 $tagHash[$kv[0]] = $kv[1]
@@ -130,22 +128,13 @@ foreach ($row in $rows) {
         $log.Info("Tags applied")
     }
 
-    # ----- REST call -----
     $body = @{ properties = $properties } | ConvertTo-Json -Depth 10
-    $apiVersion = "2023-06-06"
-    $uri = "https://management.azure.com$machineId/replicate?api-version=$apiVersion"
+    $uri  = "https://management.azure.com$machineId/replicate?api-version=2023-06-06"
 
-    $log.Step("Submitting replication request to Azure Migrate")
-
-    try {
-        Invoke-AzRestMethod -Method POST -Uri $uri -Payload $body | Out-Null
-        $log.Info("Replication request ACCEPTED")
-    }
-    catch {
-        $log.Error("Replication request FAILED")
-        $log.Error($_.Exception.Message)
-        throw
-    }
+    # ---------- EXECUTE ----------
+    $log.Step("Submitting replication request")
+    Invoke-AzRestMethod -Method POST -Uri $uri -Payload $body | Out-Null
+    $log.Info("Replication request ACCEPTED")
 }
 
-$log.Step("Replication automation completed successfully")
+$log.Step("Script completed successfully")
